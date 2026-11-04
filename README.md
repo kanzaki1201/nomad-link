@@ -8,6 +8,16 @@ any application, in any language.
 
 Version **0.11.47**, protocol **1**.
 
+## This fork
+
+This fork of the Blender extension also receives Nomad edits on meshes posed by an Armature modifier.
+
+To install it, uninstall the stock Nomad Blender Link, disable the nomadsculpt.com repository, then in **Edit > Preferences > Get Extensions > Repositories** select **+ > Add Remote Repository** and enter:
+
+```
+https://github.com/kanzaki1201/nomad-link/releases/latest/download/index.json
+```
+
 ## Contents
 
 - `PROTOCOL.md` — the specification
