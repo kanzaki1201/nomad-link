@@ -169,5 +169,15 @@ obj.modifiers[0].use_deform_preserve_volume = True
 packet, data = delta_packet(obj, [0], numpy.zeros((1, 3)))
 check("delta gate failure: refused", receive(addon.receive_delta, packet, data) == addon.MODIFIER_MESSAGE)
 
+for label, change in (
+    ("vertex groups off", lambda o: setattr(o.modifiers[0], "use_vertex_groups", False)),
+    ("bone envelopes on", lambda o: setattr(o.modifiers[0], "use_bone_envelopes", True)),
+    ("shape keys", lambda o: o.shape_key_add(name="Basis")),
+):
+    obj, arm = build()
+    header, binary = sent(obj)
+    change(obj)
+    check(f"{label}: refused", receive(addon.receive_mesh, header, binary) == addon.MODIFIER_MESSAGE)
+
 print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + ', '.join(fails)}")
 sys.exit(1 if fails else 0)
