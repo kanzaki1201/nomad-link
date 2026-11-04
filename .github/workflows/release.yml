@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the extension version matches the tag
+        run: grep -qx "version = \"${VERSION#v}\"" blender/nomad_blender_link/blender_manifest.toml
+
+      - name: Build the Blender extension ZIP
+        run: |
+          mkdir -p dist
+          cd blender/nomad_blender_link
+          zip -r -X "../../dist/nomad_blender_link-${VERSION#v}.zip" . -x '__pycache__/*' '*.pyc'
+
+      - name: Write the Blender extension repository index
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, tomllib
+          v = os.environ["VERSION"][1:]
+          name = f"nomad_blender_link-{v}.zip"
+          data = open(f"dist/{name}", "rb").read()
+          with open("blender/nomad_blender_link/blender_manifest.toml", "rb") as f:
+              entry = tomllib.load(f)
+          entry.update(archive_url=f"./{name}", archive_size=len(data),
+                       archive_hash="sha256:" + hashlib.sha256(data).hexdigest())
+          json.dump({"version": "v1", "blocklist": [], "data": [entry]},
+                    open("dist/index.json", "w"), indent=2)
+          PY
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$VERSION" dist/* --title "$VERSION" --notes "Blender extension ZIP and remote repository index. See the README."
