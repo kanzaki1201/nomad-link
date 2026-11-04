@@ -557,6 +557,9 @@ def armature_gate(obj, vertex_count, layers=()):
         and modifiers[0].type == "ARMATURE"
         and modifiers[0].object is not None
         and not modifiers[0].use_deform_preserve_volume
+        and modifiers[0].use_vertex_groups
+        and not modifiers[0].use_bone_envelopes
+        and obj.data.shape_keys is None
         and vertex_count == len(obj.data.vertices)
         and not layers
     )
