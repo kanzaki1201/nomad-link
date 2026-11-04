@@ -5,6 +5,7 @@ Runs inside Blender: blender --background --factory-startup --python tests/test_
 import os, sys
 import numpy
 import bpy
+from mathutils import Matrix
 
 ADDON_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, ADDON_DIR)
@@ -57,6 +58,8 @@ def build():
     modifier.object = arm
     bpy.context.view_layer.objects.active = arm
     bpy.ops.object.mode_set(mode="POSE")
+    for pose_bone in arm.pose.bones:
+        pose_bone.rotation_mode = "XYZ"
     arm.pose.bones["a"].rotation_euler = (0.3, 0.0, 0.0)
     arm.pose.bones["b"].rotation_euler = (0.0, 0.7, 0.0)
     arm.pose.bones["c"].rotation_euler = (0.5, 0.0, 0.4)
@@ -104,7 +107,10 @@ def groups_state(obj):
 
 def receive(function, header, binary):
     addon.connection.error = ""
-    function(header, bytes(binary))
+    try:
+        function(header, bytes(binary))
+    except RuntimeError as exc:
+        return str(exc)
     bpy.context.view_layer.update()
     return addon.connection.error
 
@@ -116,8 +122,8 @@ header, binary = sent(obj)
 before = posed(obj)
 rest = rest_state(obj)
 groups = groups_state(obj)
-check("pose moves the mesh", numpy.abs(before - rest).max() > 0.2)
-check("gate passes", addon.armature_gate(obj, len(obj.data.vertices)))
+check("pose moves the mesh", numpy.abs(before - rest).max() > 0.3)
+check("gate passes", addon.armature_gate(obj, len(obj.data.vertices), len(obj.data.polygons)))
 sculpted = before + offset
 set_positions(header, binary, sculpted)
 error = receive(addon.receive_mesh, header, binary)
@@ -170,6 +176,10 @@ packet, data = delta_packet(obj, [0], numpy.zeros((1, 3)))
 check("delta gate failure: refused", receive(addon.receive_delta, packet, data) == addon.MODIFIER_MESSAGE)
 
 for label, change in (
+    ("modifier viewport off", lambda o: setattr(o.modifiers[0], "show_viewport", False)),
+    ("mask vertex group", lambda o: setattr(o.modifiers[0], "vertex_group", "a")),
+    ("rest position", lambda o: setattr(o.modifiers[0].object.data, "pose_position", "REST")),
+    ("deform bbone", lambda o: setattr(o.modifiers[0].object.data.bones["b"], "bbone_segments", 3)),
     ("vertex groups off", lambda o: setattr(o.modifiers[0], "use_vertex_groups", False)),
     ("bone envelopes on", lambda o: setattr(o.modifiers[0], "use_bone_envelopes", True)),
     ("shape keys", lambda o: o.shape_key_add(name="Basis")),
@@ -178,6 +188,47 @@ for label, change in (
     header, binary = sent(obj)
     change(obj)
     check(f"{label}: refused", receive(addon.receive_mesh, header, binary) == addon.MODIFIER_MESSAGE)
+
+obj, arm = build()
+header, binary = sent(obj)
+header["corner_count"] -= int(addon.read_array(binary, header["face_size_offset"], header["face_count"], "<i4")[-1])
+header["face_count"] -= 1
+check("face count change: refused", receive(addon.receive_mesh, header, binary) == addon.MODIFIER_MESSAGE)
+
+obj, arm = build()
+header, binary = sent(obj)
+set_positions(header, binary, posed(obj) + offset)
+check("first receive", receive(addon.receive_mesh, header, binary) == "")
+for vertex in obj.data.vertices:
+    if vertex.index % 3 == 0:
+        obj.vertex_groups["a"].add([vertex.index], 0.2, "REPLACE")
+        obj.vertex_groups["c"].add([vertex.index], 0.8, "REPLACE")
+bpy.context.view_layer.update()
+header, binary = sent(obj)
+sculpted = posed(obj) + offset
+set_positions(header, binary, sculpted)
+check("second receive after weight edit", receive(addon.receive_mesh, header, binary) == "")
+check("weight edit: evaluated equals sent posed", numpy.abs(posed(obj) - sculpted).max() < 1e-4, f"{numpy.abs(posed(obj) - sculpted).max():.2e}")
+
+obj, arm = build()
+header, binary = sent(obj)
+sculpted = posed(obj) + offset
+set_positions(header, binary, sculpted)
+world = Matrix.Translation((1.0, 0.5, 0.25)) @ Matrix.Rotation(0.5, 4, "Z") @ obj.matrix_world
+header["world_matrix"] = addon.matrix_to_columns(addon.TO_NOMAD @ world @ addon.TO_BLENDER)
+check("world matrix change: no error", receive(addon.receive_mesh, header, binary) == "")
+check("world matrix change: object moved", numpy.abs(numpy.array(obj.matrix_world) - numpy.array(world)).max() < 1e-4)
+check("world matrix change: evaluated equals sent posed", numpy.abs(posed(obj) - sculpted).max() < 1e-4, f"{numpy.abs(posed(obj) - sculpted).max():.2e}")
+
+obj, arm = build()
+obj.modifiers[0].use_deform_preserve_volume = True
+header, binary = sent(obj)
+try:
+    addon.receive_packet(header, bytes(binary))
+    surfaced = ""
+except Exception as exc:
+    surfaced = str(exc)
+check("receive_packet: refusal raises for the dispatch loop", surfaced == addon.MODIFIER_MESSAGE, surfaced)
 
 print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + ', '.join(fails)}")
 sys.exit(1 if fails else 0)

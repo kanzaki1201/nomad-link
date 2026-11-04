@@ -547,38 +547,34 @@ def restore_vertex_groups(obj, snapshot):
     obj.vertex_groups.active_index = active
 
 
-skin_cache = {}
-
-
-def armature_gate(obj, vertex_count, layers=()):
+def armature_gate(obj, vertex_count, face_count, layers=()):
     modifiers = obj.modifiers
     return (
         len(modifiers) == 1
         and modifiers[0].type == "ARMATURE"
         and modifiers[0].object is not None
+        and modifiers[0].show_viewport
+        and not modifiers[0].vertex_group
         and not modifiers[0].use_deform_preserve_volume
         and modifiers[0].use_vertex_groups
         and not modifiers[0].use_bone_envelopes
+        and modifiers[0].object.data.pose_position == "POSE"
+        and not any(bone.use_deform and bone.bbone_segments > 1 for bone in modifiers[0].object.data.bones)
         and obj.data.shape_keys is None
         and vertex_count == len(obj.data.vertices)
+        and face_count == len(obj.data.polygons)
         and not layers
     )
 
 
-def skin_weights(obj):
-    names = tuple(group.name for group in obj.vertex_groups)
-    key = (obj.data.as_pointer(), len(obj.data.vertices), names)
-    cached = skin_cache.get(obj.as_pointer())
-    if cached is not None and cached[0] == key:
-        return cached[1:]
-    entries = [(vertex.index, element.group, element.weight) for vertex in obj.data.vertices for element in vertex.groups]
-    table = numpy.array(entries, numpy.float64).reshape(-1, 3)
-    skin_cache[obj.as_pointer()] = (key, names, table[:, 0].astype(numpy.intp), table[:, 1].astype(numpy.intp), table[:, 2])
-    return skin_cache[obj.as_pointer()][1:]
-
-
 def inverse_skin(obj, indices, posed):
-    names, entry_vertex, entry_group, entry_weight = skin_weights(obj)
+    names = [group.name for group in obj.vertex_groups]
+    vertices = obj.data.vertices
+    entries = numpy.array(
+        [(row, element.group, element.weight) for row, index in enumerate(indices) for element in vertices[int(index)].groups],
+        numpy.float64,
+    ).reshape(-1, 3)
+    rows, groups, weights = entries[:, 0].astype(numpy.intp), entries[:, 1].astype(numpy.intp), entries[:, 2]
     armature = obj.modifiers[0].object
     to_armature = obj.matrix_world.inverted() @ armature.matrix_world
     bones = armature.data.bones
@@ -589,20 +585,20 @@ def inverse_skin(obj, indices, posed):
         if bone is not None and bone.use_deform:
             matrices[slot] = numpy.array(to_armature @ armature.pose.bones[name].matrix @ bone.matrix_local.inverted() @ to_armature.inverted())
             active[slot] = 1.0
-    row = numpy.full(len(obj.data.vertices), -1, numpy.intp)
-    row[indices] = numpy.arange(len(indices))
-    picked = row[entry_vertex] >= 0
-    rows, groups, weights = row[entry_vertex[picked]], entry_group[picked], entry_weight[picked] * active[entry_group[picked]]
+    weights = weights * active[groups]
     total = numpy.zeros(len(indices))
     blend = numpy.zeros((len(indices), 4, 4))
     numpy.add.at(total, rows, weights)
     numpy.add.at(blend, rows, weights[:, None, None] * matrices[groups])
-    skinned = total > 0.0
+    skinned = total > 1e-4
     blend[skinned] /= total[skinned][:, None, None]
     blend[~skinned] = numpy.eye(4)
     homogeneous = numpy.column_stack((posed, numpy.ones(len(indices))))
-    return numpy.einsum("nij,nj->ni", numpy.linalg.inv(blend), homogeneous)[:, :3]
-
+    try:
+        inverse = numpy.linalg.inv(blend)
+    except numpy.linalg.LinAlgError:
+        raise RuntimeError("A bone transform cannot be inverted; the posed edit was not applied")
+    return numpy.einsum("nij,nj->ni", inverse, homogeneous)[:, :3]
 
 def set_mapping_transform(mapping, offset, scale, rotation):
     sine = math.sin(rotation)
@@ -1140,9 +1136,8 @@ def receive_mesh(header, binary):
     mesh_id = header["mesh_id"]
     obj = find_linked_object(mesh_id)
     skinned = obj is not None and sends_evaluated(obj)
-    if skinned and not armature_gate(obj, vertex_count, header.get("layers")):
-        connection.error = MODIFIER_MESSAGE
-        return
+    if skinned and not armature_gate(obj, vertex_count, face_count, header.get("layers")):
+        raise RuntimeError(MODIFIER_MESSAGE)
     restore_mode = None
     if obj is not None and obj.mode != "OBJECT":
         restore_mode = enter_object_mode(obj)
@@ -1165,6 +1160,8 @@ def receive_mesh(header, binary):
             mesh = obj.data
             rebuild = True
             if skinned:
+                if "world_matrix" in header:
+                    apply_object_transform(obj, header)
                 positions = inverse_skin(obj, numpy.arange(vertex_count), positions)
         groups = None
         if rebuild:
@@ -1286,7 +1283,7 @@ def receive_delta(header, binary):
         connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
         return
     skinned = sends_evaluated(obj)
-    if skinned and not armature_gate(obj, len(obj.data.vertices)):
+    if skinned and not armature_gate(obj, len(obj.data.vertices), len(obj.data.polygons)):
         connection.error = MODIFIER_MESSAGE
         return
     write_mode = geometry_write_mode(obj)
@@ -1307,6 +1304,8 @@ def receive_delta(header, binary):
         targets = to_blender_vectors(read_array(binary, header["position_offset"], count * 3, "<f4").reshape(-1, 3))
         targets, moved = targets[valid], indices[valid]
         if skinned:
+            if "world_matrix" in header:
+                apply_object_transform(obj, header)
             targets = inverse_skin(obj, moved, targets)
         if keys:
             key_positions = [foreach_get(key.data, "co", 3) for key in keys]
@@ -1377,7 +1376,7 @@ def receive_attributes(header, binary):
     if obj is None:
         connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
         return
-    if sends_evaluated(obj) and not armature_gate(obj, int(header["vertex_count"])):
+    if sends_evaluated(obj) and not armature_gate(obj, int(header["vertex_count"]), len(obj.data.polygons)):
         connection.error = MODIFIER_MESSAGE
         return
     write_mode = geometry_write_mode(obj)
